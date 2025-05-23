@@ -7,6 +7,7 @@ import pandas as pd
 import requests
 from fake_useragent import UserAgent
 import concurrent.futures # Added concurrent.futures
+import re # Added for secid validation
 
 # Create a logger
 logger = logging.getLogger('stock_crawler')
@@ -61,61 +62,142 @@ def get_stock_list():
     """
     Retrieves all A-share stock codes and names from Eastmoney.
     """
-    logger.info("Attempting to retrieve stock list from Eastmoney...")
+    logger.info("Attempting to retrieve full stock list from Eastmoney with pagination...")
     url = "http://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1,
-        "pz": 10000,
-        "po": 1,
-        "np": 1,
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": 2,
-        "invt": 2,
-        "fid": "f3",
-        "fs": "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23", # Should cover SH, SZ, BJ A-shares
-        "fields": "f12,f13,f14",  # f12: code, f13: secid (market.code), f14: name
-        "_": int(time.time() * 1000)
+    page_size = 200  # Moderate page size
+    all_stocks_data_raw = [] # To accumulate raw stock items from all pages
+    
+    base_params = {
+        "po": 1, "np": 1, "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": 2, "invt": 2, "fid": "f3",
+        "fs": "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23",
+        "fields": "f12,f13,f14", # f12: code, f13: secid, f14: name
+        "pz": page_size
     }
-    # ua is global now
-    headers = {"User-Agent": ua.random}
+    headers = {"User-Agent": ua.random} # ua is global
+
+    # --- Initial Request ---
+    logger.info(f"Fetching first page of stock list (pn=1, pz={page_size})...")
+    current_params = base_params.copy()
+    current_params["pn"] = 1
+    current_params["_"] = int(time.time() * 1000)
 
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-
+        response = requests.get(url, params=current_params, headers=headers, timeout=10)
+        response.raise_for_status()
         data = response.json()
-        if not data or "data" not in data or "diff" not in data["data"]:
-            logger.error("Eastmoney API response structure is not as expected.")
+
+        if not data or "data" not in data:
+            logger.error("Eastmoney API response structure for initial page is not as expected (missing 'data' field).")
             return []
 
-        stock_list_raw = data["data"]["diff"]
-        stocks = []
-        for stock_item in stock_list_raw:
-            if "f12" in stock_item and "f13" in stock_item and "f14" in stock_item:
-                code = stock_item["f12"]    # e.g., "600519"
-                secid = stock_item["f13"]   # e.g., "1.600519" or "0.000001"
-                name = stock_item["f14"]    # e.g., "贵州茅台"
-                
-                # The 'code' field in worker_task expects the stock code with prefix like 'SH600519'
-                # get_kline_data uses this to construct its own secid.
-                # Let's adjust what 'code' we store in the stock_list.
-                # Or, we change worker_task to use secid directly.
-                # For now, let's keep 'code' as f12, and add 'secid'.
-                # The problem description implies worker_task will be updated later.
-                # The current subtask is only about get_stock_list and its logging.
-                
-                stocks.append({"code": code, "name": name, "secid": secid})
-            else:
-                logger.warning(f"Missing 'f12', 'f13', or 'f14' in stock item: {stock_item}")
+        total_stocks_from_api = data["data"].get("total", 0)
+        logger.info(f"Eastmoney API reports total of {total_stocks_from_api} stocks for the query.")
+
+        if total_stocks_from_api == 0:
+            logger.warning("API reports 0 total stocks. Returning empty list.")
+            return []
+            
+        current_page_stocks = data["data"].get("diff", [])
+        if not current_page_stocks:
+            logger.warning("No stocks found on the first page ('diff' field is empty or missing), despite API reporting total > 0.")
+            # Depending on API behavior, we might still continue if total_stocks_from_api > 0
+            # For now, if first page is empty but total > 0, it's suspicious.
+            # However, the loop condition will handle fetching subsequent pages if num_pages > 1.
         
-        logger.info(f"Successfully retrieved {len(stocks)} stocks with code, name, and secid.")
-        return stocks
+        all_stocks_data_raw.extend(current_page_stocks)
+        logger.info(f"Retrieved {len(current_page_stocks)} stocks from the first page.")
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching stock list from Eastmoney: {e}")
+        logger.error(f"Error fetching initial page of stock list: {e}", exc_info=True)
+        return [] # Abort if the first page fails
+    except ValueError as e: # JSON decoding error
+        logger.error(f"Error decoding JSON for initial page of stock list: {e}", exc_info=True)
         return []
-    except ValueError as e: # For JSON decoding errors
-        logger.error(f"Error decoding JSON response from Eastmoney stock list API: {e}")
+
+    # --- Pagination Loop ---
+    if total_stocks_from_api <= page_size:
+        logger.info("All stocks fetched on the first page.")
+    else:
+        num_pages = (total_stocks_from_api + page_size - 1) // page_size
+        logger.info(f"Total pages to fetch: {num_pages}")
+
+        for page_num in range(2, num_pages + 1):
+            logger.info(f"Fetching page {page_num}/{num_pages} from stock list API...")
+            current_params["pn"] = page_num
+            current_params["_"] = int(time.time() * 1000)
+            
+            try:
+                response = requests.get(url, params=current_params, headers=headers, timeout=10)
+                response.raise_for_status()
+                page_data = response.json()
+
+                if not page_data or "data" not in page_data or "diff" not in page_data["data"]:
+                    logger.warning(f"Page {page_num} response structure error or missing 'diff'. Skipping this page.")
+                    continue # Try next page
+
+                current_page_stocks = page_data["data"]["diff"]
+                if not current_page_stocks:
+                    logger.warning(f"No stocks found on page {page_num} ('diff' field is empty).")
+                    # Consider if we should break here. If total is reliable, missing data on an intermediate page is odd.
+                    # For now, continue, as other pages might still have data.
+                    continue 
+                
+                all_stocks_data_raw.extend(current_page_stocks)
+                logger.info(f"Retrieved {len(current_page_stocks)} stocks from page {page_num}. Total accumulated: {len(all_stocks_data_raw)}")
+                time.sleep(0.5) # Be polite to the server
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching page {page_num} of stock list: {e}", exc_info=True)
+                # Continue to the next page
+            except ValueError as e: # JSON decoding error
+                logger.error(f"Error decoding JSON for page {page_num} of stock list: {e}", exc_info=True)
+                # Continue to the next page
+
+    # --- Processing Paginated Results ---
+    final_stock_list = []
+    # Regex for basic secid validation (e.g., "0.dddddd", "1.dddddd", "8.dddddd" - though Eastmoney uses 0. and 1. for A-shares)
+    # Stricter: A-shares are typically 0. (SZ) or 1. (SH/BJ) followed by 6 digits.
+    # The fs parameter already filters for these markets.
+    secid_regex = re.compile(r"^[01]\.\d{6}$") 
+
+    logger.debug(f"Starting processing of {len(all_stocks_data_raw)} raw stock items from API.")
+    for item_index, stock_item in enumerate(all_stocks_data_raw):
+        # Optional: Detailed debug log for each raw item
+        # logger.debug(f"Raw stock data item {item_index + 1}: {stock_item}")
+
+        code = stock_item.get("f12")
+        name = stock_item.get("f14")
+        secid_candidate = stock_item.get("f13")
+
+        if not all([code, name, secid_candidate]):
+            logger.warning(f"Missing essential fields (f12, f13, or f14) in item: {stock_item}. Skipping.")
+            continue
+
+        # Validate secid_candidate
+        is_valid_secid = False
+        if isinstance(secid_candidate, str):
+            if secid_regex.match(secid_candidate):
+                is_valid_secid = True
+            else:
+                # Fallback for potential variations if regex is too strict initially (e.g. BJ with other prefixes if API changes)
+                # For now, stick to regex. If issues, this is where to broaden.
+                # Example simple check: '.' in secid_candidate and len(secid_candidate.split('.')[0]) > 0 and secid_candidate.split('.')[1].isdigit()
+                pass 
+        
+        if is_valid_secid:
+            final_stock_list.append({"code": code, "name": name, "secid": secid_candidate})
+        else:
+            logger.warning(f"Invalid or missing secid (f13 value: '{secid_candidate}') for stock code {code}. Skipping this stock.")
+            
+    logger.info(f"Successfully processed {len(final_stock_list)} stock entries with valid secids (accumulated from {len(all_stocks_data_raw)} raw items).")
+    if len(final_stock_list) != total_stocks_from_api and total_stocks_from_api > 0:
+         # This warning might trigger more often now if many secids are invalid
+         logger.warning(f"Mismatch: API reported {total_stocks_from_api} stocks, but processed {len(final_stock_list)} after secid validation. Some data might be missing or had invalid secids.")
+    
+    return final_stock_list
+
+# --- Function to get K-line data ---
         return []
 
 # --- Function to get K-line data ---
@@ -123,9 +205,18 @@ def get_kline_data(secid: str, stock_code: str, stock_name: str, num_days: int):
     """
     Retrieves 120-minute K-line data for a given stock from Eastmoney using its secid.
     """
+    # --- secid Validation ---
+    # Regex for A-share secid validation (e.g., "0.dddddd", "1.dddddd")
+    # Consistent with the one in get_stock_list.
+    secid_kline_regex = re.compile(r"^[01]\.\d{6}$") 
+    if not isinstance(secid, str) or not secid_kline_regex.match(secid):
+        logger.error(f"Invalid secid format received in get_kline_data: '{secid}' for stock {stock_code} ({stock_name}). Aborting K-line fetch for this stock.")
+        return None # Or return [] if that's more consistent, but None for error is fine.
+    # --- End secid Validation ---
+
     logger.info(f"Attempting to retrieve K-line data for {stock_name} ({stock_code}, secid: {secid}) for {num_days} days.")
 
-    # secid is now directly passed as an argument. No need to determine it.
+    # secid is now directly passed as an argument and validated.
     # Example secid: "1.600519" for SH, "0.000001" for SZ, "1.830777" for BJ.
 
     url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -347,32 +438,58 @@ if __name__ == "__main__":
     # logger.info("--- Specific Stock Testing Complete ---")
 
     # --- Full Crawl Logic (Re-enabled) ---
-    stock_list = get_stock_list() 
+    stock_list_full = get_stock_list() # Renamed to avoid confusion with processed_stock_list
     
-    if not stock_list:
-        logger.error("No stock list retrieved. Exiting full crawl.")
+    if not stock_list_full:
+        logger.error("No stock list retrieved from get_stock_list(). Exiting full crawl.")
     else:
-        # Slicing logic and associated logs removed.
-        # The following log will now reflect the full count from get_stock_list().
-        logger.info(f"Preparing to process {len(stock_list)} stocks using up to {MAX_WORKERS} workers.")
+        logger.info(f"Retrieved {len(stock_list_full)} total stocks from get_stock_list() for processing.")
+
+        # --- Temporary Slicing & Specific Stock Inclusion for K-line Processing ---
+        problematic_stock_code = "300584" # 海辰药业
+        problematic_stock_info = next((s for s in stock_list_full if s['code'] == problematic_stock_code), None)
+        
+        test_slice_size = 250 
+        processed_stock_list = [] # Initialize
+
+        if len(stock_list_full) > test_slice_size:
+            logger.info(f"Slicing full stock list from {len(stock_list_full)} to {test_slice_size} for K-line fetching test run.")
+            processed_stock_list = stock_list_full[:test_slice_size]
+        else:
+            processed_stock_list = list(stock_list_full) # Use a copy
+            logger.info(f"Full stock list size ({len(stock_list_full)}) is within test slice size. Processing all retrieved stocks.")
+
+        if problematic_stock_info:
+            # Check if it's already in the (potentially sliced) list
+            if not any(s['code'] == problematic_stock_code for s in processed_stock_list):
+                processed_stock_list.append(problematic_stock_info)
+                logger.info(f"Added problematic stock {problematic_stock_code} ('{problematic_stock_info['name']}') to the current test batch. New batch size: {len(processed_stock_list)} stocks.")
+            else:
+                logger.info(f"Problematic stock {problematic_stock_code} ('{problematic_stock_info['name']}') already in the sliced list.")
+        elif problematic_stock_code: # Only warn if a code was specified
+            logger.warning(f"Problematic stock code {problematic_stock_code} not found in the full list from get_stock_list().")
+        # --- End Slicing & Specific Stock Inclusion ---
+
+        logger.info(f"Preparing to process {len(processed_stock_list)} stocks for K-line data using up to {MAX_WORKERS} workers.")
         success_count = 0
         failure_count = 0 
         
         futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            logger.debug("Starting task submission to ThreadPoolExecutor.")
-            for stock_item in stock_list:
+            logger.debug("Starting task submission to ThreadPoolExecutor for processed_stock_list.")
+            for stock_item in processed_stock_list: # Use processed_stock_list here
                 logger.debug(f"Submitting task for {stock_item.get('code', 'N/A')} - {stock_item.get('name', 'N/A')}")
                 futures.append(executor.submit(worker_task, stock_item, args.days, args.output_dir))
-            logger.info(f"All {len(futures)} tasks submitted to executor.")
+            logger.info(f"All {len(futures)} tasks submitted to executor from processed_stock_list.")
             
-            total_stocks = len(stock_list) # Same as len(futures)
+            # total_stocks should now reflect the count of the list being processed
+            total_stocks_to_process = len(processed_stock_list) 
             processed_count = 0
     
             logger.debug("Waiting for tasks to complete (using as_completed).")
             for future in concurrent.futures.as_completed(futures):
                 processed_count += 1
-                logger.debug(f"Future completed. Processing result for task {processed_count}/{total_stocks}...")
+                logger.debug(f"Future completed. Processing result for task {processed_count}/{total_stocks_to_process}...")
                 try:
                     result_from_future = future.result()
                     if result_from_future: 
@@ -381,19 +498,16 @@ if __name__ == "__main__":
                         failure_count += 1
                     logger.debug(f"Result for a task: {result_from_future}. Current Success: {success_count}, Current Failure: {failure_count}")
                 except Exception as e:
-                    # Log which stock this was for, if possible.
-                    # This requires mapping futures to inputs, which is more involved.
-                    # For now, just enhance the existing log.
                     logger.error(f"A task resulted in an exception: {e}", exc_info=True)
                     failure_count += 1
                 
-                if processed_count % LOG_PROGRESS_INTERVAL == 0 or processed_count == total_stocks:
-                    logger.info(f"Progress: Processed {processed_count}/{total_stocks} stocks. Success: {success_count}, Failed: {failure_count}")
+                if processed_count % LOG_PROGRESS_INTERVAL == 0 or processed_count == total_stocks_to_process:
+                    logger.info(f"Progress: Processed {processed_count}/{total_stocks_to_process} stocks. Success: {success_count}, Failed: {failure_count}")
     
-        logger.info("Crawling complete!")
-        logger.info(f"Summary: Total Stocks: {total_stocks}, Tasks Succeeded (data saved or no data): {success_count}, Tasks Failed (errors): {failure_count}")
+        logger.info("K-line data crawling complete for the processed list!")
+        logger.info(f"Summary for processed list: Total Stocks: {total_stocks_to_process}, Tasks Succeeded: {success_count}, Tasks Failed: {failure_count}")
 
     end_time = time.time()
     total_time = end_time - start_time
-    logger.info(f"Total time taken for script execution: {total_time:.2f} seconds")
+    logger.info(f"Total time taken for script execution (including full get_stock_list and processed K-line fetch): {total_time:.2f} seconds")
     logger.info("Stock crawler script finished.")
