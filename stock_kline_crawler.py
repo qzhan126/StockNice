@@ -158,42 +158,57 @@ def get_stock_list():
     final_stock_list = []
     # Regex for basic secid validation (e.g., "0.dddddd", "1.dddddd", "8.dddddd" - though Eastmoney uses 0. and 1. for A-shares)
     # Stricter: A-shares are typically 0. (SZ) or 1. (SH/BJ) followed by 6 digits.
-    # The fs parameter already filters for these markets.
-    secid_regex = re.compile(r"^[01]\.\d{6}$") 
+    secid_validation_regex = re.compile(r"^[01]\.\d{6}$") 
 
     logger.debug(f"Starting processing of {len(all_stocks_data_raw)} raw stock items from API.")
     for item_index, stock_item in enumerate(all_stocks_data_raw):
-        # Optional: Detailed debug log for each raw item
-        # logger.debug(f"Raw stock data item {item_index + 1}: {stock_item}")
+        # logger.debug(f"Raw stock data item {item_index + 1}: {stock_item}") # Uncomment for very detailed debug
 
-        code = stock_item.get("f12")
-        name = stock_item.get("f14")
-        secid_candidate = stock_item.get("f13")
+        f12_code = stock_item.get('f12')
+        f13_value = stock_item.get('f13') # This is the secid candidate or market type
+        f14_name = stock_item.get('f14')
 
-        if not all([code, name, secid_candidate]):
-            logger.warning(f"Missing essential fields (f12, f13, or f14) in item: {stock_item}. Skipping.")
+        if not f12_code or not f14_name:
+            logger.warning(f"Missing f12 (code: '{f12_code}') or f14 (name: '{f14_name}') in item: {stock_item}. Skipping.")
             continue
 
-        # Validate secid_candidate
-        is_valid_secid = False
-        if isinstance(secid_candidate, str):
-            if secid_regex.match(secid_candidate):
-                is_valid_secid = True
-            else:
-                # Fallback for potential variations if regex is too strict initially (e.g. BJ with other prefixes if API changes)
-                # For now, stick to regex. If issues, this is where to broaden.
-                # Example simple check: '.' in secid_candidate and len(secid_candidate.split('.')[0]) > 0 and secid_candidate.split('.')[1].isdigit()
-                pass 
+        secid_to_validate = None
+
+        if isinstance(f13_value, int):
+            if f13_value == 0: # Typically SZ market
+                # Check if f12_code is 6 digits; regex later will also check this.
+                if len(f12_code) == 6 and f12_code.isdigit():
+                    secid_to_validate = f"0.{f12_code}"
+                    logger.info(f"f13 is integer 0 for code {f12_code}. Reconstructed secid to '{secid_to_validate}'.")
+                else:
+                    logger.warning(f"f13 is integer 0, but f12_code '{f12_code}' is not a 6-digit string. Skipping.")
+                    continue
+            elif f13_value == 1: # Typically SH or BJ market
+                if len(f12_code) == 6 and f12_code.isdigit():
+                    secid_to_validate = f"1.{f12_code}"
+                    logger.info(f"f13 is integer 1 for code {f12_code}. Reconstructed secid to '{secid_to_validate}'.")
+                else:
+                    logger.warning(f"f13 is integer 1, but f12_code '{f12_code}' is not a 6-digit string. Skipping.")
+                    continue
+            else: # Other integer values for f13
+                logger.warning(f"Unsupported integer f13 value: {f13_value} for stock code {f12_code}. Skipping.")
+                continue
+        elif isinstance(f13_value, str):
+            secid_to_validate = f13_value
+        else: # f13_value is not an int or str (e.g., None, or other type)
+            logger.warning(f"Invalid or missing f13 type (value: '{f13_value}') for stock code {f12_code}. Skipping.")
+            continue
         
-        if is_valid_secid:
-            final_stock_list.append({"code": code, "name": name, "secid": secid_candidate})
+        # Now, validate secid_to_validate
+        if secid_to_validate and secid_validation_regex.match(secid_to_validate):
+            final_stock_list.append({"code": f12_code, "name": f14_name, "secid": secid_to_validate})
         else:
-            logger.warning(f"Invalid or missing secid (f13 value: '{secid_candidate}') for stock code {code}. Skipping this stock.")
+            logger.warning(f"Constructed or provided secid '{secid_to_validate}' for stock code {f12_code} failed validation or was None. Skipping.")
+            # No continue here, as it's the end of the loop iteration
             
     logger.info(f"Successfully processed {len(final_stock_list)} stock entries with valid secids (accumulated from {len(all_stocks_data_raw)} raw items).")
     if len(final_stock_list) != total_stocks_from_api and total_stocks_from_api > 0:
-         # This warning might trigger more often now if many secids are invalid
-         logger.warning(f"Mismatch: API reported {total_stocks_from_api} stocks, but processed {len(final_stock_list)} after secid validation. Some data might be missing or had invalid secids.")
+         logger.warning(f"Mismatch: API reported {total_stocks_from_api} stocks, but processed {len(final_stock_list)} after secid validation and reconstruction. Some data might be missing or had invalid/unsupported f13 values.")
     
     return final_stock_list
 
