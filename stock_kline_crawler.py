@@ -352,16 +352,8 @@ if __name__ == "__main__":
     if not stock_list:
         logger.error("No stock list retrieved. Exiting full crawl.")
     else:
-        # --- Slicing for testing concurrent processing ---
-        original_stock_count = len(stock_list)
-        slice_count = 100 # Arbitrary number for testing, should be > MAX_WORKERS
-        if original_stock_count > slice_count:
-            stock_list = stock_list[:slice_count]
-            logger.info(f"Original stock list size: {original_stock_count}. Using a sliced list of {len(stock_list)} stocks for testing concurrent processing.")
-        else:
-            logger.info(f"Original stock list size: {original_stock_count}. Full list is used as it's smaller than or equal to slice_count ({slice_count}).")
-        # --- End Slicing ---
-
+        # Slicing logic and associated logs removed.
+        # The following log will now reflect the full count from get_stock_list().
         logger.info(f"Preparing to process {len(stock_list)} stocks using up to {MAX_WORKERS} workers.")
         success_count = 0
         failure_count = 0 
