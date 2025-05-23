@@ -198,9 +198,7 @@ def get_stock_list():
     return final_stock_list
 
 # --- Function to get K-line data ---
-        return []
-
-# --- Function to get K-line data ---
+# Removed extraneous "return []" that was here
 def get_kline_data(secid: str, stock_code: str, stock_name: str, num_days: int):
     """
     Retrieves 120-minute K-line data for a given stock from Eastmoney using its secid.
