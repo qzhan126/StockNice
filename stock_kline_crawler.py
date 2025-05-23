@@ -12,7 +12,9 @@ import concurrent.futures # Added concurrent.futures
 logger = logging.getLogger('stock_crawler')
 # Initialize UserAgent globally if it's used in multiple functions
 ua = UserAgent()
-logger.setLevel(logging.INFO) # Ensure logger level is set
+# For this task, setting to DEBUG to see all new log messages.
+# Can be set back to INFO for less verbosity.
+logger.setLevel(logging.DEBUG) 
 
 # --- Constants ---
 MAX_WORKERS = 10 # Max concurrent threads for fetching data
@@ -131,67 +133,76 @@ def get_kline_data(secid: str, stock_code: str, stock_name: str, num_days: int):
     start_date = (datetime.today() - timedelta(days=num_days)).strftime('%Y%m%d')
 
     params = {
-        "secid": secid, # Directly use the provided secid
+        "secid": secid, 
         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
         "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61", # date,open,close,high,low,volume,amount,amplitude,change_percent,change_amount,turnover_rate
-        "klt": "120",  # 120-minute K-line
-        "fqt": "1",    # Forward-adjusted prices
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "120",
+        "fqt": "1",
         "beg": start_date,
         "end": end_date,
-        "lmt": 100000, # Sufficiently large limit
+        "lmt": 100000,
         "_": int(time.time() * 1000)
     }
-    headers = {"User-Agent": ua.random}
-
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=20) # Increased timeout
-        response.raise_for_status()
-        
-        data = response.json()
-
-        if not data or "data" not in data or not data["data"]:
-            logger.info(f"No K-line data found for {stock_name} ({stock_code}, secid: {secid}) (data field is null or missing).")
-            return []
-
-        klines_raw = data["data"].get("klines")
-        if not klines_raw or not isinstance(klines_raw, list):
-            logger.info(f"No K-line data found for {stock_name} ({stock_code}, secid: {secid}) (klines field is missing or not a list).")
-            return []
-
-        processed_klines = []
-        # Expected fields: date,open,close,high,low,volume,amount,amplitude,change_percent,change_amount,turnover_rate
-        for k_str in klines_raw:
-            parts = k_str.split(',')
-            if len(parts) < 7: # Ensure we have at least up to 'amount'
-                logger.warning(f"Skipping malformed k-line string for {stock_code} (secid: {secid}): {k_str}")
-                continue
+    
+    # Using requests.Session
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": ua.random}) # ua is global
+        try:
+            response = session.get(url, params=params, timeout=20) # Increased timeout
+            response.raise_for_status() # Raises HTTPError for 4xx/5xx responses
             
-            kline_datetime_str = parts[0]
+            data = response.json()
 
-            processed_klines.append({
-                "datetime": kline_datetime_str,
-                "open": float(parts[1]),
-                "close": float(parts[2]),
-                "high": float(parts[3]),
-                "low": float(parts[4]),
-                "volume": float(parts[5]),
-                "amount": float(parts[6]),
-                "stock_code": stock_code, # Use the non-prefixed stock_code
-                "stock_name": stock_name
-            })
-        
-        logger.info(f"Successfully retrieved {len(processed_klines)} K-line data points for {stock_name} ({stock_code}, secid: {secid}).")
-        return processed_klines
+            if not data or "data" not in data or not data["data"]:
+                logger.info(f"No K-line data found for {stock_name} ({stock_code}, secid: {secid}) (data field is null or missing).")
+                return [] # Consistent with existing logic for no data
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching K-line data for {stock_name} ({stock_code}, secid: {secid}): {e}")
-        return None
-    except ValueError as e: # For JSON decoding errors
-        logger.error(f"Error decoding K-line JSON response for {stock_name} ({stock_code}, secid: {secid}): {e}")
-        return None
-    except Exception as e: # Catch any other unexpected errors during processing
-        logger.error(f"An unexpected error occurred while processing K-line data for {stock_name} ({stock_code}, secid: {secid}): {e}")
+            klines_raw = data["data"].get("klines")
+            if not klines_raw or not isinstance(klines_raw, list):
+                logger.info(f"No K-line data found for {stock_name} ({stock_code}, secid: {secid}) (klines field is missing or not a list).")
+                return [] # Consistent
+
+            processed_klines = []
+            for k_str in klines_raw:
+                parts = k_str.split(',')
+                if len(parts) < 7:
+                    logger.warning(f"Skipping malformed k-line string for {stock_code} (secid: {secid}): {k_str}")
+                    continue
+                
+                kline_datetime_str = parts[0]
+                processed_klines.append({
+                    "datetime": kline_datetime_str,
+                    "open": float(parts[1]),
+                    "close": float(parts[2]),
+                    "high": float(parts[3]),
+                    "low": float(parts[4]),
+                    "volume": float(parts[5]),
+                    "amount": float(parts[6]),
+                    "stock_code": stock_code, 
+                    "stock_name": stock_name
+                })
+            
+            logger.info(f"Successfully retrieved {len(processed_klines)} K-line data points for {stock_name} ({stock_code}, secid: {secid}).")
+            return processed_klines
+
+        except requests.exceptions.HTTPError as e:
+            # Specific logging for HTTP errors (e.g., 403 Forbidden, 404 Not Found, 500 Server Error)
+            logger.error(f"HTTP error for {stock_name} ({stock_code}, secid: {secid}): {e.response.status_code} - {e.response.reason}. URL: {e.request.url}")
+            return None # Return None for error cases
+        except requests.exceptions.RequestException as e:
+            # Catches other request-related errors like ConnectionError, Timeout, TooManyRedirects
+            logger.error(f"Request exception for {stock_name} ({stock_code}, secid: {secid}): {e}", exc_info=True)
+            return None
+        except ValueError as e: # Specifically for JSON decoding errors
+            logger.error(f"Error decoding K-line JSON response for {stock_name} ({stock_code}, secid: {secid}): {e}", exc_info=True)
+            return None
+        except Exception as e: # Catch any other unexpected errors during processing
+            logger.error(f"An unexpected error occurred while processing K-line data for {stock_name} ({stock_code}, secid: {secid}): {e}", exc_info=True)
+            return None
+        # Session is automatically closed when exiting the 'with' block
+
+# --- Function to process and save K-line data ---
         return None
 
 # --- Function to process and save K-line data ---
@@ -297,78 +308,100 @@ if __name__ == "__main__":
     logger.info("Starting stock crawler script.")
     start_time = time.time()
 
-    # --- Specific Stock Testing ---
-    logger.info("--- Starting Specific Stock Testing ---")
-    test_stocks_info = [
-        {'code': '301075', 'name': '多瑞医药', 'secid': '0.301075'}, # ChiNext
-        {'code': '688001', 'name': '华兴源创', 'secid': '1.688001'}, # STAR Market
-        {'code': '600519', 'name': '贵州茅台', 'secid': '1.600519'}, # Shanghai Main
-        {'code': '000001', 'name': '平安银行', 'secid': '0.000001'}, # Shenzhen Main
-        {'code': '830777', 'name': '中纺标', 'secid': '1.830777'}    # Beijing SE
-    ]
+    # --- Specific Stock Testing (Commented out for full crawl testing) ---
+    # logger.info("--- Starting Specific Stock Testing ---")
+    # test_stocks_info = [
+    #     {'code': '301075', 'name': '多瑞医药', 'secid': '0.301075'}, # ChiNext
+    #     {'code': '688001', 'name': '华兴源创', 'secid': '1.688001'}, # STAR Market
+    #     {'code': '600519', 'name': '贵州茅台', 'secid': '1.600519'}, # Shanghai Main
+    #     {'code': '000001', 'name': '平安银行', 'secid': '0.000001'}, # Shenzhen Main
+    #     {'code': '830777', 'name': '中纺标', 'secid': '1.830777'}    # Beijing SE
+    # ]
+    #
+    # for stock_info_test in test_stocks_info:
+    #     logger.info(f"Testing specific stock: {stock_info_test['name']} ({stock_info_test['code']}, secid: {stock_info_test['secid']})")
+    #     try:
+    #         kline_data_test = get_kline_data(
+    #             stock_info_test['secid'], 
+    #             stock_info_test['code'], 
+    #             stock_info_test['name'], 
+    #             args.days
+    #         )
+    #         if kline_data_test is None:
+    #             logger.error(f"Test failed for {stock_info_test['name']}: K-line data retrieval returned None.")
+    #         elif not kline_data_test:
+    #             logger.info(f"Test completed for {stock_info_test['name']}: No K-line data points found.")
+    #         else:
+    #             logger.info(f"Test for {stock_info_test['name']}: Retrieved {len(kline_data_test)} data points. Processing and saving...")
+    #             process_and_save_data(
+    #                 kline_data_test, 
+    #                 stock_info_test['code'], 
+    #                 stock_info_test['name'], 
+    #                 stock_info_test['secid'], 
+    #                 args.output_dir
+    #             )
+    #             logger.info(f"Test successful for {stock_info_test['name']}: Data processed and saved.")
+    #     except Exception as e:
+    #         logger.error(f"Test failed for {stock_info_test['name']} with exception: {e}", exc_info=True)
+    # 
+    # logger.info("--- Specific Stock Testing Complete ---")
 
-    for stock_info_test in test_stocks_info:
-        logger.info(f"Testing specific stock: {stock_info_test['name']} ({stock_info_test['code']}, secid: {stock_info_test['secid']})")
-        try:
-            kline_data_test = get_kline_data(
-                stock_info_test['secid'], 
-                stock_info_test['code'], 
-                stock_info_test['name'], 
-                args.days
-            )
-            if kline_data_test is None:
-                logger.error(f"Test failed for {stock_info_test['name']}: K-line data retrieval returned None.")
-            elif not kline_data_test:
-                logger.info(f"Test completed for {stock_info_test['name']}: No K-line data points found.")
-            else:
-                logger.info(f"Test for {stock_info_test['name']}: Retrieved {len(kline_data_test)} data points. Processing and saving...")
-                process_and_save_data(
-                    kline_data_test, 
-                    stock_info_test['code'], 
-                    stock_info_test['name'], 
-                    stock_info_test['secid'], 
-                    args.output_dir
-                )
-                logger.info(f"Test successful for {stock_info_test['name']}: Data processed and saved.")
-        except Exception as e:
-            logger.error(f"Test failed for {stock_info_test['name']} with exception: {e}", exc_info=True)
+    # --- Full Crawl Logic (Re-enabled) ---
+    stock_list = get_stock_list() 
     
-    logger.info("--- Specific Stock Testing Complete ---")
+    if not stock_list:
+        logger.error("No stock list retrieved. Exiting full crawl.")
+    else:
+        # --- Slicing for testing concurrent processing ---
+        original_stock_count = len(stock_list)
+        slice_count = 100 # Arbitrary number for testing, should be > MAX_WORKERS
+        if original_stock_count > slice_count:
+            stock_list = stock_list[:slice_count]
+            logger.info(f"Original stock list size: {original_stock_count}. Using a sliced list of {len(stock_list)} stocks for testing concurrent processing.")
+        else:
+            logger.info(f"Original stock list size: {original_stock_count}. Full list is used as it's smaller than or equal to slice_count ({slice_count}).")
+        # --- End Slicing ---
 
-    # --- Full Crawl Logic (Commented out for specific testing) ---
-    # stock_list = get_stock_list() # Call is still here, but list not used for concurrent crawl below
-    #
-    # if not stock_list:
-    #     logger.error("No stock list retrieved. Exiting full crawl.")
-    # else:
-    #     logger.info(f"Starting K-line data crawl for {len(stock_list)} stocks using up to {MAX_WORKERS} workers.")
-    #     success_count = 0
-    #     failure_count = 0 
-    #
-    #     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    #         futures = [executor.submit(worker_task, stock, args.days, args.output_dir) for stock in stock_list]
-    #         
-    #         total_stocks = len(stock_list)
-    #         processed_count = 0
-    #
-    #         for future in concurrent.futures.as_completed(futures):
-    #             processed_count += 1
-    #             try:
-    #                 result = future.result()
-    #                 if result: 
-    #                     success_count +=1
-    #                 else: 
-    #                     failure_count += 1
-    #             except Exception as e:
-    #                 logger.error(f"A future completed with an exception: {e}")
-    #                 failure_count += 1
-    #             
-    #             if processed_count % LOG_PROGRESS_INTERVAL == 0 or processed_count == total_stocks:
-    #                 logger.info(f"Progress: Processed {processed_count}/{total_stocks} stocks. Success: {success_count}, Failed: {failure_count}")
-    #
-    #     logger.info("Crawling complete!")
-    #     logger.info(f"Summary: Total Stocks: {total_stocks}, Tasks Succeeded (data saved or no data): {success_count}, Tasks Failed (errors): {failure_count}")
+        logger.info(f"Preparing to process {len(stock_list)} stocks using up to {MAX_WORKERS} workers.")
+        success_count = 0
+        failure_count = 0 
+        
+        futures = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            logger.debug("Starting task submission to ThreadPoolExecutor.")
+            for stock_item in stock_list:
+                logger.debug(f"Submitting task for {stock_item.get('code', 'N/A')} - {stock_item.get('name', 'N/A')}")
+                futures.append(executor.submit(worker_task, stock_item, args.days, args.output_dir))
+            logger.info(f"All {len(futures)} tasks submitted to executor.")
+            
+            total_stocks = len(stock_list) # Same as len(futures)
+            processed_count = 0
+    
+            logger.debug("Waiting for tasks to complete (using as_completed).")
+            for future in concurrent.futures.as_completed(futures):
+                processed_count += 1
+                logger.debug(f"Future completed. Processing result for task {processed_count}/{total_stocks}...")
+                try:
+                    result_from_future = future.result()
+                    if result_from_future: 
+                        success_count +=1
+                    else: 
+                        failure_count += 1
+                    logger.debug(f"Result for a task: {result_from_future}. Current Success: {success_count}, Current Failure: {failure_count}")
+                except Exception as e:
+                    # Log which stock this was for, if possible.
+                    # This requires mapping futures to inputs, which is more involved.
+                    # For now, just enhance the existing log.
+                    logger.error(f"A task resulted in an exception: {e}", exc_info=True)
+                    failure_count += 1
+                
+                if processed_count % LOG_PROGRESS_INTERVAL == 0 or processed_count == total_stocks:
+                    logger.info(f"Progress: Processed {processed_count}/{total_stocks} stocks. Success: {success_count}, Failed: {failure_count}")
+    
+        logger.info("Crawling complete!")
+        logger.info(f"Summary: Total Stocks: {total_stocks}, Tasks Succeeded (data saved or no data): {success_count}, Tasks Failed (errors): {failure_count}")
 
-    total_time = time.time() - start_time
+    end_time = time.time()
+    total_time = end_time - start_time
     logger.info(f"Total time taken for script execution: {total_time:.2f} seconds")
     logger.info("Stock crawler script finished.")
